@@ -1,0 +1,318 @@
+#!/bin/bash
+
+# uniclipx — set up shared clipboard sync between local Mac and a remote machine
+# Supports macOS VMs, Linux desktop VMs, and Docker containers
+
+TARGET=$1
+
+if [ -z "$TARGET" ]; then
+    echo "Usage: uniclipx <ssh-target>"
+    echo "  e.g. uniclipx agent@macos-sandbox"
+    echo "       uniclipx -p 2222 root@localhost"
+    exit 1
+fi
+
+# Extract SSH options (everything before user@host)
+SSH_OPTS=()
+while [[ "$1" == -* ]]; do
+    SSH_OPTS+=("$1" "$2")
+    shift 2
+done
+SSH_TARGET="$1"
+
+# Build the SSH command prefix
+SSH_CMD=(ssh -o ConnectTimeout=5 "${SSH_OPTS[@]}" "$SSH_TARGET")
+
+# --- Helper: prompt to install missing packages ---
+prompt_install() {
+    local description="$1"
+    local install_cmd="$2"
+    local is_remote="$3"  # "local" or "remote"
+
+    echo ""
+    echo "  Suggested install command:"
+    echo "    $install_cmd"
+    echo ""
+    read -rp "  Install now? (y/n) " answer
+    if [[ "$answer" =~ ^[Yy] ]]; then
+        echo "  Installing $description..."
+        if [ "$is_remote" = "remote" ]; then
+            "${SSH_CMD[@]}" "$install_cmd" 2>&1
+        else
+            eval "$install_cmd" 2>&1
+        fi
+        if [ $? -eq 0 ]; then
+            echo "  Installed $description successfully."
+            return 0
+        else
+            echo "  Error: Failed to install $description."
+            return 1
+        fi
+    else
+        echo "  Skipping install. Please install manually and re-run."
+        return 1
+    fi
+}
+
+# --- Helper: detect remote package manager ---
+detect_remote_pkg_manager() {
+    "${SSH_CMD[@]}" bash -l -c "'
+        if command -v brew &>/dev/null; then echo brew
+        elif command -v apt-get &>/dev/null; then echo apt
+        elif command -v dnf &>/dev/null; then echo dnf
+        elif command -v yum &>/dev/null; then echo yum
+        elif command -v pacman &>/dev/null; then echo pacman
+        else echo unknown; fi
+    '" 2>/dev/null
+}
+
+# --- Helper: get remote arch for binary download ---
+get_remote_arch() {
+    local arch
+    arch=$("${SSH_CMD[@]}" "uname -m" 2>/dev/null)
+    case "$arch" in
+        x86_64)  echo "x86_64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        armv6*|armv7*) echo "armv6" ;;
+        i*86)    echo "32-bit" ;;
+        *)       echo "$arch" ;;
+    esac
+}
+
+# --- Step 0: Check local prerequisites ---
+if ! command -v uniclip &>/dev/null; then
+    echo "Error: uniclip is not installed locally."
+    if command -v brew &>/dev/null; then
+        prompt_install "uniclip (local)" "brew install quackduck/tap/uniclip" "local" || exit 1
+    else
+        echo "  Install via Homebrew: brew install quackduck/tap/uniclip"
+        echo "  Or download from: https://github.com/quackduck/uniclip/releases"
+        exit 1
+    fi
+fi
+
+# --- Step 1: Check SSH connectivity ---
+if ! "${SSH_CMD[@]}" "echo ok" &>/dev/null; then
+    echo "Error: Cannot connect to $SSH_TARGET"
+    exit 1
+fi
+
+# --- Step 2: Detect remote OS and environment ---
+REMOTE_OS=$("${SSH_CMD[@]}" "uname -s" 2>/dev/null)
+
+if [ "$REMOTE_OS" = "Linux" ] && "${SSH_CMD[@]}" "[ -f /.dockerenv ]" &>/dev/null; then
+    REMOTE_TYPE="docker"
+elif [ "$REMOTE_OS" = "Darwin" ]; then
+    REMOTE_TYPE="macos"
+else
+    REMOTE_TYPE="linux"
+fi
+
+# --- Step 3: Check and install remote prerequisites ---
+MISSING=()
+
+# Check uniclip on remote
+REMOTE_BIN=$("${SSH_CMD[@]}" bash -l -c "'which uniclip 2>/dev/null'" 2>/dev/null)
+if [ -z "$REMOTE_BIN" ]; then
+    REMOTE_BIN=$("${SSH_CMD[@]}" "for p in /opt/homebrew/bin/uniclip /usr/local/bin/uniclip /home/linuxbrew/.linuxbrew/bin/uniclip /snap/bin/uniclip; do [ -x \"\$p\" ] && echo \"\$p\" && break; done" 2>/dev/null)
+fi
+[ -z "$REMOTE_BIN" ] && MISSING+=("uniclip")
+
+# Check tmux on remote (needed for macOS and headless Linux)
+REMOTE_TMUX=$("${SSH_CMD[@]}" bash -l -c "'which tmux 2>/dev/null'" 2>/dev/null)
+if [ -z "$REMOTE_TMUX" ]; then
+    REMOTE_TMUX=$("${SSH_CMD[@]}" "for p in /opt/homebrew/bin/tmux /usr/bin/tmux /usr/local/bin/tmux; do [ -x \"\$p\" ] && echo \"\$p\" && break; done" 2>/dev/null)
+fi
+if [ -z "$REMOTE_TMUX" ] && [ "$REMOTE_TYPE" != "linux" ]; then
+    MISSING+=("tmux")
+fi
+
+# Check xvfb and xclip (needed for headless Linux / Docker)
+if [ "$REMOTE_TYPE" = "docker" ]; then
+    "${SSH_CMD[@]}" "which Xvfb" &>/dev/null || MISSING+=("xvfb")
+    "${SSH_CMD[@]}" "which xclip" &>/dev/null || MISSING+=("xclip")
+fi
+
+# If linux desktop but no desktop session, we'll need xvfb/xclip/tmux too
+if [ "$REMOTE_TYPE" = "linux" ]; then
+    HAS_DESKTOP=$("${SSH_CMD[@]}" "pgrep -x gnome-shell || pgrep -x gnome-session || pgrep -x plasmashell || pgrep -x xfce4-session || pgrep -x sway || pgrep -x cinnamon" 2>/dev/null)
+    if [ -z "$HAS_DESKTOP" ]; then
+        "${SSH_CMD[@]}" bash -l -c "'which Xvfb'" &>/dev/null || MISSING+=("xvfb")
+        "${SSH_CMD[@]}" bash -l -c "'which xclip'" &>/dev/null || MISSING+=("xclip")
+        [ -z "$REMOTE_TMUX" ] && MISSING+=("tmux")
+    fi
+fi
+
+# --- Install missing components ---
+if [ ${#MISSING[@]} -gt 0 ]; then
+    echo ""
+    echo "Missing on $SSH_TARGET: ${MISSING[*]}"
+
+    PKG_MGR=$(detect_remote_pkg_manager)
+    REMOTE_ARCH=$(get_remote_arch)
+
+    for pkg in "${MISSING[@]}"; do
+        case "$pkg" in
+            uniclip)
+                echo ""
+                echo "  uniclip is not installed on $SSH_TARGET."
+                if [ "$REMOTE_OS" = "Darwin" ]; then
+                    prompt_install "uniclip" "brew install quackduck/tap/uniclip" "remote" || exit 1
+                else
+                    echo "  Install options:"
+                    echo "    1) Homebrew on Linux (if available): brew install quackduck/tap/uniclip"
+                    echo "    2) Download binary from GitHub releases"
+                    if [ "$PKG_MGR" = "brew" ]; then
+                        prompt_install "uniclip" "brew install quackduck/tap/uniclip" "remote" || exit 1
+                    else
+                        DOWNLOAD_URL="https://github.com/quackduck/uniclip/releases/latest/download/uniclip_2.3.6_Linux_${REMOTE_ARCH}.tar.gz"
+                        prompt_install "uniclip" "curl -fsSL '$DOWNLOAD_URL' -o /tmp/uniclip.tar.gz && sudo tar xzf /tmp/uniclip.tar.gz -C /usr/local/bin uniclip && sudo chmod +x /usr/local/bin/uniclip && rm /tmp/uniclip.tar.gz" "remote" || exit 1
+                    fi
+                fi
+                # Re-detect binary path after install
+                REMOTE_BIN=$("${SSH_CMD[@]}" bash -l -c "'which uniclip 2>/dev/null'" 2>/dev/null)
+                if [ -z "$REMOTE_BIN" ]; then
+                    REMOTE_BIN=$("${SSH_CMD[@]}" "for p in /opt/homebrew/bin/uniclip /usr/local/bin/uniclip /home/linuxbrew/.linuxbrew/bin/uniclip /snap/bin/uniclip; do [ -x \"\$p\" ] && echo \"\$p\" && break; done" 2>/dev/null)
+                fi
+                if [ -z "$REMOTE_BIN" ]; then
+                    echo "Error: uniclip still not found after install."
+                    exit 1
+                fi
+                ;;
+            tmux)
+                echo ""
+                echo "  tmux is not installed on $SSH_TARGET."
+                case "$REMOTE_OS" in
+                    Darwin)
+                        prompt_install "tmux" "brew install tmux" "remote" || exit 1 ;;
+                    *)
+                        case "$PKG_MGR" in
+                            apt)    prompt_install "tmux" "sudo apt-get install -y tmux" "remote" || exit 1 ;;
+                            dnf)    prompt_install "tmux" "sudo dnf install -y tmux" "remote" || exit 1 ;;
+                            yum)    prompt_install "tmux" "sudo yum install -y tmux" "remote" || exit 1 ;;
+                            pacman) prompt_install "tmux" "sudo pacman -S --noconfirm tmux" "remote" || exit 1 ;;
+                            brew)   prompt_install "tmux" "brew install tmux" "remote" || exit 1 ;;
+                            *)
+                                echo "  Could not detect package manager. Please install tmux manually."
+                                exit 1 ;;
+                        esac ;;
+                esac
+                ;;
+            xvfb)
+                echo ""
+                echo "  Xvfb is not installed on $SSH_TARGET (needed for headless clipboard)."
+                case "$PKG_MGR" in
+                    apt)    prompt_install "xvfb" "sudo apt-get install -y xvfb" "remote" || exit 1 ;;
+                    dnf)    prompt_install "xvfb" "sudo dnf install -y xorg-x11-server-Xvfb" "remote" || exit 1 ;;
+                    yum)    prompt_install "xvfb" "sudo yum install -y xorg-x11-server-Xvfb" "remote" || exit 1 ;;
+                    pacman) prompt_install "xvfb" "sudo pacman -S --noconfirm xorg-server-xvfb" "remote" || exit 1 ;;
+                    *)
+                        echo "  Could not detect package manager. Please install Xvfb manually."
+                        exit 1 ;;
+                esac
+                ;;
+            xclip)
+                echo ""
+                echo "  xclip is not installed on $SSH_TARGET (needed for headless clipboard)."
+                case "$PKG_MGR" in
+                    apt)    prompt_install "xclip" "sudo apt-get install -y xclip" "remote" || exit 1 ;;
+                    dnf)    prompt_install "xclip" "sudo dnf install -y xclip" "remote" || exit 1 ;;
+                    yum)    prompt_install "xclip" "sudo yum install -y xclip" "remote" || exit 1 ;;
+                    pacman) prompt_install "xclip" "sudo pacman -S --noconfirm xclip" "remote" || exit 1 ;;
+                    *)
+                        echo "  Could not detect package manager. Please install xclip manually."
+                        exit 1 ;;
+                esac
+                ;;
+        esac
+    done
+    echo ""
+fi
+
+# --- Step 4: Start or find Host Uniclip ---
+HOST_PID=$(pgrep -x uniclip)
+if [ -z "$HOST_PID" ]; then
+    echo "Starting Uniclip on Host..."
+    uniclip > /dev/null 2>&1 &
+    sleep 2
+    HOST_PID=$(pgrep -x uniclip)
+fi
+
+# --- Step 5: Get the listening port ---
+ACTUAL_PORT=$(lsof -nP -iTCP -sTCP:LISTEN | grep uniclip | awk '{print $9}' | sed 's/.*://' | head -n 1)
+
+if [[ ! "$ACTUAL_PORT" =~ ^[0-9]+$ ]]; then
+    echo "Error: Could not detect uniclip port. (Got: '$ACTUAL_PORT')"
+    exit 1
+fi
+
+# --- Step 6: Determine the right host address ---
+if [ "$REMOTE_TYPE" = "docker" ]; then
+    HOST_ADDR="host.docker.internal"
+else
+    HOST_ADDR=$(ifconfig bridge100 2>/dev/null | awk '/inet / {print $2}')
+    if [ -z "$HOST_ADDR" ]; then
+        HOST_ADDR=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null)
+    fi
+fi
+
+if [ -z "$HOST_ADDR" ]; then
+    echo "Error: Could not determine host address reachable from remote."
+    exit 1
+fi
+
+HOST_NAME=$(scutil --get LocalHostName 2>/dev/null).local
+echo "Host: $HOST_NAME ($HOST_ADDR) | Port: $ACTUAL_PORT | Remote: $REMOTE_TYPE"
+
+# --- Step 7: Start uniclip client on remote ---
+if [ "$REMOTE_TYPE" = "macos" ]; then
+    # macOS — tmux preserves pasteboard access
+    echo "Connecting $SSH_TARGET to $HOST_ADDR:$ACTUAL_PORT..."
+    "${SSH_CMD[@]}" bash -l -c "'
+        pkill -x uniclip 2>/dev/null
+        tmux kill-session -t uniclip 2>/dev/null
+        sleep 0.5
+        tmux new-session -d -s uniclip \"$REMOTE_BIN $HOST_ADDR:$ACTUAL_PORT\"
+    '"
+elif [ "$REMOTE_TYPE" = "docker" ]; then
+    # Docker container (headless) — use Xvfb for xclip
+    echo "Connecting $SSH_TARGET to $HOST_ADDR:$ACTUAL_PORT (headless/Xvfb)..."
+    "${SSH_CMD[@]}" bash -l -c "'
+        pkill -x uniclip 2>/dev/null
+        tmux kill-session -t uniclip 2>/dev/null
+        pkill Xvfb 2>/dev/null
+        sleep 0.5
+        Xvfb :99 -screen 0 1x1x8 &>/dev/null &
+        sleep 1
+        tmux new-session -d -s uniclip -e DISPLAY=:99 \"$REMOTE_BIN $HOST_ADDR:$ACTUAL_PORT\"
+    '"
+else
+    # Linux VM — check if a desktop session is active
+    if [ -n "$HAS_DESKTOP" ]; then
+        # Desktop session active — use systemd-run to inherit GUI clipboard context
+        echo "Connecting $SSH_TARGET to $HOST_ADDR:$ACTUAL_PORT (desktop session)..."
+        "${SSH_CMD[@]}" "pkill -x uniclip 2>/dev/null; systemctl --user stop uniclip 2>/dev/null; sleep 0.5; systemd-run --user --unit=uniclip -- $REMOTE_BIN $HOST_ADDR:$ACTUAL_PORT" 2>/dev/null
+    else
+        # No desktop session (headless) — use Xvfb
+        echo "Connecting $SSH_TARGET to $HOST_ADDR:$ACTUAL_PORT (headless/Xvfb)..."
+        "${SSH_CMD[@]}" bash -l -c "'
+            pkill -x uniclip 2>/dev/null
+            tmux kill-session -t uniclip 2>/dev/null
+            pkill Xvfb 2>/dev/null
+            sleep 0.5
+            Xvfb :99 -screen 0 1x1x8 &>/dev/null &
+            sleep 1
+            tmux new-session -d -s uniclip -e DISPLAY=:99 \"$REMOTE_BIN $HOST_ADDR:$ACTUAL_PORT\"
+        '"
+    fi
+fi
+sleep 2
+
+# --- Step 8: Verify the remote process is running ---
+if "${SSH_CMD[@]}" "pgrep -x uniclip > /dev/null" 2>/dev/null; then
+    REMOTE_PID=$("${SSH_CMD[@]}" "pgrep -x uniclip")
+    echo "Success: Sync active on $SSH_TARGET (PID $REMOTE_PID)."
+else
+    echo "Error: uniclip failed to start on $SSH_TARGET."
+    exit 1
+fi

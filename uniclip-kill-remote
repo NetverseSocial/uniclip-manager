@@ -1,0 +1,6 @@
+#!/bin/bash
+TARGET_DOMAIN=$1
+[ -z "$TARGET_DOMAIN" ] && { echo "Usage: unikillx <domain>"; exit 1; }
+
+echo "Stopping Uniclip on $TARGET_DOMAIN..."
+ssh "$TARGET_DOMAIN" "pkill -x uniclip"
