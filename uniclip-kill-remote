@@ -1,6 +1,25 @@
 #!/bin/bash
 TARGET_DOMAIN=$1
-[ -z "$TARGET_DOMAIN" ] && { echo "Usage: unikillx <domain>"; exit 1; }
+[ -z "$TARGET_DOMAIN" ] && { echo "Usage: uniclip-kill-remote <domain>"; exit 1; }
 
-echo "Stopping Uniclip on $TARGET_DOMAIN..."
-ssh "$TARGET_DOMAIN" "pkill -x uniclip"
+# Extract SSH options
+SSH_OPTS=()
+while [[ "$1" == -* ]]; do
+    SSH_OPTS+=("$1" "$2")
+    shift 2
+done
+SSH_TARGET="$1"
+
+SSH_CMD=(ssh -o ConnectTimeout=5 "${SSH_OPTS[@]}" "$SSH_TARGET")
+
+echo "Stopping Uniclip on $SSH_TARGET..."
+
+# Detect OS and kill accordingly
+REMOTE_OS=$("${SSH_CMD[@]}" "uname -s" 2>/dev/null)
+if [[ "$REMOTE_OS" == MSYS_NT* ]] || [[ "$REMOTE_OS" == MINGW* ]] || [[ "$REMOTE_OS" == CYGWIN* ]] || { [ -z "$REMOTE_OS" ] && "${SSH_CMD[@]}" "ver" &>/dev/null; }; then
+    "${SSH_CMD[@]}" "taskkill /IM uniclip.exe /F & schtasks /Delete /TN uniclip /F" 2>/dev/null
+else
+    "${SSH_CMD[@]}" "pkill -x uniclip; systemctl --user stop uniclip 2>/dev/null; tmux kill-session -t uniclip 2>/dev/null" 2>/dev/null
+fi
+
+echo "Done."

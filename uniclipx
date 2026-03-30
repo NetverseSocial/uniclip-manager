@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # uniclipx — set up shared clipboard sync between local Mac and a remote machine
-# Supports macOS VMs, Linux desktop VMs, and Docker containers
+# Supports macOS VMs, Linux desktop VMs, Docker containers, and Windows VMs
 
 TARGET=$1
 
@@ -100,10 +100,17 @@ fi
 # --- Step 2: Detect remote OS and environment ---
 REMOTE_OS=$("${SSH_CMD[@]}" "uname -s" 2>/dev/null)
 
+# Windows OpenSSH returns MSYS_NT*, MINGW*, CYGWIN*, or may not have uname at all
 if [ "$REMOTE_OS" = "Linux" ] && "${SSH_CMD[@]}" "[ -f /.dockerenv ]" &>/dev/null; then
     REMOTE_TYPE="docker"
 elif [ "$REMOTE_OS" = "Darwin" ]; then
     REMOTE_TYPE="macos"
+elif [[ "$REMOTE_OS" == MSYS_NT* ]] || [[ "$REMOTE_OS" == MINGW* ]] || [[ "$REMOTE_OS" == CYGWIN* ]]; then
+    REMOTE_TYPE="windows"
+elif [ -z "$REMOTE_OS" ] && "${SSH_CMD[@]}" "ver" &>/dev/null; then
+    # No uname but 'ver' works — Windows without Git Bash
+    REMOTE_TYPE="windows"
+    REMOTE_OS="Windows"
 else
     REMOTE_TYPE="linux"
 fi
@@ -112,18 +119,23 @@ fi
 MISSING=()
 
 # Check uniclip on remote
-REMOTE_BIN=$("${SSH_CMD[@]}" bash -l -c "'which uniclip 2>/dev/null'" 2>/dev/null)
-if [ -z "$REMOTE_BIN" ]; then
-    REMOTE_BIN=$("${SSH_CMD[@]}" "for p in /opt/homebrew/bin/uniclip /usr/local/bin/uniclip /home/linuxbrew/.linuxbrew/bin/uniclip /snap/bin/uniclip; do [ -x \"\$p\" ] && echo \"\$p\" && break; done" 2>/dev/null)
+if [ "$REMOTE_TYPE" = "windows" ]; then
+    REMOTE_BIN=$("${SSH_CMD[@]}" "where uniclip.exe 2>nul || where uniclip 2>nul" 2>/dev/null | tr -d '\r' | head -1)
+    [ -z "$REMOTE_BIN" ] && MISSING+=("uniclip")
+else
+    REMOTE_BIN=$("${SSH_CMD[@]}" bash -l -c "'which uniclip 2>/dev/null'" 2>/dev/null)
+    if [ -z "$REMOTE_BIN" ]; then
+        REMOTE_BIN=$("${SSH_CMD[@]}" "for p in /opt/homebrew/bin/uniclip /usr/local/bin/uniclip /home/linuxbrew/.linuxbrew/bin/uniclip /snap/bin/uniclip; do [ -x \"\$p\" ] && echo \"\$p\" && break; done" 2>/dev/null)
+    fi
+    [ -z "$REMOTE_BIN" ] && MISSING+=("uniclip")
 fi
-[ -z "$REMOTE_BIN" ] && MISSING+=("uniclip")
 
 # Check tmux on remote (needed for macOS and headless Linux)
 REMOTE_TMUX=$("${SSH_CMD[@]}" bash -l -c "'which tmux 2>/dev/null'" 2>/dev/null)
 if [ -z "$REMOTE_TMUX" ]; then
     REMOTE_TMUX=$("${SSH_CMD[@]}" "for p in /opt/homebrew/bin/tmux /usr/bin/tmux /usr/local/bin/tmux; do [ -x \"\$p\" ] && echo \"\$p\" && break; done" 2>/dev/null)
 fi
-if [ -z "$REMOTE_TMUX" ] && [ "$REMOTE_TYPE" != "linux" ]; then
+if [ -z "$REMOTE_TMUX" ] && [ "$REMOTE_TYPE" != "linux" ] && [ "$REMOTE_TYPE" != "windows" ]; then
     MISSING+=("tmux")
 fi
 
@@ -158,6 +170,16 @@ if [ ${#MISSING[@]} -gt 0 ]; then
                 echo "  uniclip is not installed on $SSH_TARGET."
                 if [ "$REMOTE_OS" = "Darwin" ]; then
                     prompt_install "uniclip" "brew install quackduck/tap/uniclip" "remote" || exit 1
+                elif [ "$REMOTE_TYPE" = "windows" ]; then
+                    # Detect Windows architecture
+                    WIN_ARCH=$("${SSH_CMD[@]}" "echo %PROCESSOR_ARCHITECTURE%" 2>/dev/null | tr -d '\r')
+                    case "$WIN_ARCH" in
+                        AMD64) WIN_DL_ARCH="x86_64" ;;
+                        ARM64) WIN_DL_ARCH="arm64" ;;
+                        *)     WIN_DL_ARCH="x86_64" ;;
+                    esac
+                    DOWNLOAD_URL="https://github.com/quackduck/uniclip/releases/latest/download/uniclip_2.3.6_Windows_${WIN_DL_ARCH}.zip"
+                    prompt_install "uniclip" "powershell -Command \"Invoke-WebRequest -Uri '$DOWNLOAD_URL' -OutFile \$env:TEMP\\uniclip.zip; Expand-Archive -Path \$env:TEMP\\uniclip.zip -DestinationPath 'C:\\Program Files\\uniclip' -Force; \$oldPath = [Environment]::GetEnvironmentVariable('Path','Machine'); if (\$oldPath -notlike '*uniclip*') { [Environment]::SetEnvironmentVariable('Path', \$oldPath + ';C:\\Program Files\\uniclip', 'Machine') }; Remove-Item \$env:TEMP\\uniclip.zip\"" "remote" || exit 1
                 else
                     echo "  Install options:"
                     echo "    1) Homebrew on Linux (if available): brew install quackduck/tap/uniclip"
@@ -170,9 +192,13 @@ if [ ${#MISSING[@]} -gt 0 ]; then
                     fi
                 fi
                 # Re-detect binary path after install
-                REMOTE_BIN=$("${SSH_CMD[@]}" bash -l -c "'which uniclip 2>/dev/null'" 2>/dev/null)
-                if [ -z "$REMOTE_BIN" ]; then
-                    REMOTE_BIN=$("${SSH_CMD[@]}" "for p in /opt/homebrew/bin/uniclip /usr/local/bin/uniclip /home/linuxbrew/.linuxbrew/bin/uniclip /snap/bin/uniclip; do [ -x \"\$p\" ] && echo \"\$p\" && break; done" 2>/dev/null)
+                if [ "$REMOTE_TYPE" = "windows" ]; then
+                    REMOTE_BIN=$("${SSH_CMD[@]}" "where uniclip.exe 2>nul || where uniclip 2>nul" 2>/dev/null | tr -d '\r' | head -1)
+                else
+                    REMOTE_BIN=$("${SSH_CMD[@]}" bash -l -c "'which uniclip 2>/dev/null'" 2>/dev/null)
+                    if [ -z "$REMOTE_BIN" ]; then
+                        REMOTE_BIN=$("${SSH_CMD[@]}" "for p in /opt/homebrew/bin/uniclip /usr/local/bin/uniclip /home/linuxbrew/.linuxbrew/bin/uniclip /snap/bin/uniclip; do [ -x \"\$p\" ] && echo \"\$p\" && break; done" 2>/dev/null)
+                    fi
                 fi
                 if [ -z "$REMOTE_BIN" ]; then
                     echo "Error: uniclip still not found after install."
@@ -265,54 +291,63 @@ HOST_NAME=$(scutil --get LocalHostName 2>/dev/null).local
 echo "Host: $HOST_NAME ($HOST_ADDR) | Port: $ACTUAL_PORT | Remote: $REMOTE_TYPE"
 
 # --- Step 7: Start uniclip client on remote ---
-if [ "$REMOTE_TYPE" = "macos" ]; then
+if [ "$REMOTE_TYPE" = "windows" ]; then
+    # Windows — use schtasks to run uniclip in the interactive desktop session
+    # (SSH session clipboard is isolated from the desktop)
+    echo "Connecting $SSH_TARGET to $HOST_ADDR:$ACTUAL_PORT..."
+    "${SSH_CMD[@]}" "taskkill /IM uniclip.exe /F 2>nul & timeout /t 1 >nul" 2>/dev/null
+    REMOTE_BIN_ESC=$(echo "$REMOTE_BIN" | tr -d '\r')
+    "${SSH_CMD[@]}" "powershell -Command \"schtasks /Delete /TN uniclip /F 2>\$null; schtasks /Create /TN uniclip /TR '\\\"$REMOTE_BIN_ESC\\\" $HOST_ADDR:$ACTUAL_PORT' /SC ONCE /ST 00:00 /F /RL HIGHEST; schtasks /Run /TN uniclip\"" >/dev/null 2>/dev/null
+    sleep 2
+    if "${SSH_CMD[@]}" "tasklist /FI \"IMAGENAME eq uniclip.exe\" 2>nul | find \"uniclip\"" &>/dev/null; then
+        echo "Success: Sync active on $SSH_TARGET."
+    else
+        echo "Error: uniclip failed to start on $SSH_TARGET."
+        exit 1
+    fi
+elif [ "$REMOTE_TYPE" = "macos" ]; then
     # macOS — tmux preserves pasteboard access
     echo "Connecting $SSH_TARGET to $HOST_ADDR:$ACTUAL_PORT..."
-    "${SSH_CMD[@]}" bash -l -c "'
-        pkill -x uniclip 2>/dev/null
-        tmux kill-session -t uniclip 2>/dev/null
-        sleep 0.5
-        tmux new-session -d -s uniclip \"$REMOTE_BIN $HOST_ADDR:$ACTUAL_PORT\"
-    '"
+    LAUNCH_RESULT=$("${SSH_CMD[@]}" "pkill -x uniclip 2>/dev/null; PATH=/opt/homebrew/bin:\$PATH tmux kill-session -t uniclip 2>/dev/null; sleep 0.5; PATH=/opt/homebrew/bin:\$PATH tmux new-session -d -s uniclip '$REMOTE_BIN $HOST_ADDR:$ACTUAL_PORT'; sleep 2; pgrep -x uniclip" 2>/dev/null)
+    if [ -n "$LAUNCH_RESULT" ]; then
+        echo "Success: Sync active on $SSH_TARGET (PID $LAUNCH_RESULT)."
+    else
+        echo "Error: uniclip failed to start on $SSH_TARGET."
+        exit 1
+    fi
 elif [ "$REMOTE_TYPE" = "docker" ]; then
     # Docker container (headless) — use Xvfb for xclip
     echo "Connecting $SSH_TARGET to $HOST_ADDR:$ACTUAL_PORT (headless/Xvfb)..."
-    "${SSH_CMD[@]}" bash -l -c "'
-        pkill -x uniclip 2>/dev/null
-        tmux kill-session -t uniclip 2>/dev/null
-        pkill Xvfb 2>/dev/null
-        sleep 0.5
-        Xvfb :99 -screen 0 1x1x8 &>/dev/null &
-        sleep 1
-        tmux new-session -d -s uniclip -e DISPLAY=:99 \"$REMOTE_BIN $HOST_ADDR:$ACTUAL_PORT\"
-    '"
+    LAUNCH_RESULT=$("${SSH_CMD[@]}" "pkill -x uniclip 2>/dev/null; tmux kill-session -t uniclip 2>/dev/null; pkill Xvfb 2>/dev/null; sleep 0.5; Xvfb :99 -screen 0 1x1x8 &>/dev/null & sleep 1; tmux new-session -d -s uniclip -e DISPLAY=:99 '$REMOTE_BIN $HOST_ADDR:$ACTUAL_PORT'; sleep 2; pgrep -x uniclip" 2>/dev/null)
+    if [ -n "$LAUNCH_RESULT" ]; then
+        echo "Success: Sync active on $SSH_TARGET (PID $LAUNCH_RESULT)."
+    else
+        echo "Error: uniclip failed to start on $SSH_TARGET."
+        exit 1
+    fi
 else
     # Linux VM — check if a desktop session is active
     if [ -n "$HAS_DESKTOP" ]; then
         # Desktop session active — use systemd-run to inherit GUI clipboard context
         echo "Connecting $SSH_TARGET to $HOST_ADDR:$ACTUAL_PORT (desktop session)..."
         "${SSH_CMD[@]}" "pkill -x uniclip 2>/dev/null; systemctl --user stop uniclip 2>/dev/null; sleep 0.5; systemd-run --user --unit=uniclip -- $REMOTE_BIN $HOST_ADDR:$ACTUAL_PORT" 2>/dev/null
+        sleep 2
+        if "${SSH_CMD[@]}" "pgrep -x uniclip > /dev/null" 2>/dev/null; then
+            REMOTE_PID=$("${SSH_CMD[@]}" "pgrep -x uniclip" 2>/dev/null)
+            echo "Success: Sync active on $SSH_TARGET (PID $REMOTE_PID)."
+        else
+            echo "Error: uniclip failed to start on $SSH_TARGET."
+            exit 1
+        fi
     else
         # No desktop session (headless) — use Xvfb
         echo "Connecting $SSH_TARGET to $HOST_ADDR:$ACTUAL_PORT (headless/Xvfb)..."
-        "${SSH_CMD[@]}" bash -l -c "'
-            pkill -x uniclip 2>/dev/null
-            tmux kill-session -t uniclip 2>/dev/null
-            pkill Xvfb 2>/dev/null
-            sleep 0.5
-            Xvfb :99 -screen 0 1x1x8 &>/dev/null &
-            sleep 1
-            tmux new-session -d -s uniclip -e DISPLAY=:99 \"$REMOTE_BIN $HOST_ADDR:$ACTUAL_PORT\"
-        '"
+        LAUNCH_RESULT=$("${SSH_CMD[@]}" bash -l -c "'pkill -x uniclip 2>/dev/null; tmux kill-session -t uniclip 2>/dev/null; pkill Xvfb 2>/dev/null; sleep 0.5; Xvfb :99 -screen 0 1x1x8 &>/dev/null & sleep 1; tmux new-session -d -s uniclip -e DISPLAY=:99 \"$REMOTE_BIN $HOST_ADDR:$ACTUAL_PORT\"; sleep 2; pgrep -x uniclip'" 2>/dev/null)
+        if [ -n "$LAUNCH_RESULT" ]; then
+            echo "Success: Sync active on $SSH_TARGET (PID $LAUNCH_RESULT)."
+        else
+            echo "Error: uniclip failed to start on $SSH_TARGET."
+            exit 1
+        fi
     fi
-fi
-sleep 2
-
-# --- Step 8: Verify the remote process is running ---
-if "${SSH_CMD[@]}" "pgrep -x uniclip > /dev/null" 2>/dev/null; then
-    REMOTE_PID=$("${SSH_CMD[@]}" "pgrep -x uniclip")
-    echo "Success: Sync active on $SSH_TARGET (PID $REMOTE_PID)."
-else
-    echo "Error: uniclip failed to start on $SSH_TARGET."
-    exit 1
 fi
